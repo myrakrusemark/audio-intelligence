@@ -6,9 +6,13 @@ Everything runs locally — no cloud APIs, no data leaves your machine.
 
 import sys
 import time
+import json
 import queue
+import argparse
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import numpy as np
+from scipy.signal import butter, sosfilt
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from pathlib import Path
@@ -40,8 +44,13 @@ WORD_FIXES = {
 }
 
 # ── Thresholds ──────────────────────────────────────────────────────────
-ENERGY_FLOOR = 0.005       # RMS below this = silence, skip entirely
+ENERGY_FLOOR_MIN = 0.005   # absolute minimum noise floor
+ENERGY_FLOOR_MARGIN = 1.5  # noise floor = ambient RMS * this multiplier
+NOISE_FLOOR_WINDOW = 10    # seconds of history for rolling noise floor
 SOUND_CONFIDENCE = 0.15    # default threshold for most sounds
+
+# ── Voice bandpass filter (cuts AC hum, fan noise, high-freq artifacts) ──
+VOICE_BANDPASS = butter(4, [300, 3400], btype='band', fs=SAMPLE_RATE, output='sos')
 
 # Sounds that are reliably accurate even at low confidence — give them a lower bar
 SENSITIVE_SOUNDS = {
@@ -59,7 +68,11 @@ SPEECH_ENERGY = 0.01       # RMS needed before we bother running Whisper
 
 # ── Speaker diarization ──────────────────────────────────────────────
 SPEAKER_SIM_THRESHOLD = 0.35  # cosine similarity above this = same speaker
+SPEAKER_PRESENCE_THRESHOLD = 0.25  # lower bar for detecting voice in mixed audio
 SPEAKER_MIN_AUDIO = int(SAMPLE_RATE * 1.5)  # need 1.5s of speech to diarize
+SPEAKER_ID_WINDOW = 2.0      # seconds of audio in sliding window for real-time ID
+SPEAKER_ID_STRIDE = 1.0      # run identification every N seconds
+AI_VOICE_NAMES = {"Fathom"}  # enrolled voices that are AI/TTS (for barge-in detection)
 
 # Speech-related YAMNet labels — used to gate Whisper and suppress from display
 SPEECH_SOUNDS = {
@@ -88,6 +101,31 @@ RESET = "\033[0m"
 def rms(audio):
     """Root mean square energy of an audio chunk."""
     return float(np.sqrt(np.mean(audio ** 2)))
+
+
+class NoiseFloor:
+    """Rolling adaptive noise floor from the quietest blocks."""
+
+    def __init__(self, window=NOISE_FLOOR_WINDOW):
+        self._levels = []
+        self._window = window
+        self.level = ENERGY_FLOOR_MIN
+        self._last_printed = None
+
+    def update(self, block_rms):
+        """Feed a 1s block RMS. Updates the noise floor. Prints on change."""
+        self._levels.append(block_rms)
+        if len(self._levels) > self._window:
+            self._levels.pop(0)
+        # Noise floor = 10th percentile of recent blocks (ignores speech spikes)
+        p10 = float(np.percentile(self._levels, 10))
+        old = self.level
+        self.level = max(p10 * ENERGY_FLOOR_MARGIN, ENERGY_FLOOR_MIN)
+        # Print when floor changes meaningfully (>20% shift)
+        rounded = round(self.level, 4)
+        if self._last_printed is None or abs(self.level - old) / max(old, 1e-6) > 0.2:
+            print(f"  {DIM}noise floor: {self.level:.4f}{RESET}")
+            self._last_printed = rounded
 
 
 def stitch(prev_text, new_text, min_overlap_words=2):
@@ -341,6 +379,137 @@ def assign_speakers(embeddings, threshold=SPEAKER_SIM_THRESHOLD):
 
 
 SPEAKER_NAMES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+VOICES_DIR = Path(__file__).parent / ".voices"
+
+
+def load_voice_library():
+    """Load saved voice profiles from .voices/ directory."""
+    voices = {}  # name -> {"embedding": np.array, "samples": int}
+    if not VOICES_DIR.exists():
+        return voices
+    for f in VOICES_DIR.glob("*.json"):
+        data = json.loads(f.read_text())
+        voices[data["name"]] = {
+            "embedding": np.array(data["embedding"], dtype=np.float32),
+            "samples": data.get("samples", 1),
+        }
+    return voices
+
+
+def save_voice(name, embedding, samples=1):
+    """Save a voice profile to .voices/ directory."""
+    VOICES_DIR.mkdir(exist_ok=True)
+    path = VOICES_DIR / f"{name.lower().replace(' ', '_')}.json"
+    path.write_text(json.dumps({
+        "name": name,
+        "embedding": embedding.tolist(),
+        "samples": samples,
+    }, indent=2))
+    return path
+
+
+def remove_voice(name):
+    """Remove a voice profile. Returns True if found."""
+    if not VOICES_DIR.exists():
+        return False
+    path = VOICES_DIR / f"{name.lower().replace(' ', '_')}.json"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def list_voices():
+    """List all enrolled voice names."""
+    if not VOICES_DIR.exists():
+        return []
+    names = []
+    for f in VOICES_DIR.glob("*.json"):
+        data = json.loads(f.read_text())
+        names.append((data["name"], data.get("samples", 1)))
+    return sorted(names)
+
+
+def assign_speakers(embeddings, known_voices=None, threshold=SPEAKER_SIM_THRESHOLD):
+    """Cluster embeddings into speakers. Returns (labels, profiles, confidences).
+
+    known_voices: dict of name -> {"embedding": np.array, "samples": int}
+    Known voices are seeded as initial profiles and matched first.
+    Labels for known voices use the person's name (str), unknown use int IDs.
+    """
+    if not embeddings:
+        return [], {}, {}
+
+    # Seed profiles from known voices
+    profiles = {}   # speaker_id (str name or int) -> embedding
+    counts = {}
+    next_anon_id = 0
+
+    if known_voices:
+        for name, info in known_voices.items():
+            profiles[name] = info["embedding"].copy()
+            counts[name] = info["samples"]
+
+    labels = []
+
+    prev_labels = None
+    for _ in range(3):
+        # Reset to known voices only (don't lose them between passes)
+        profiles_reset = {}
+        counts_reset = {}
+        if known_voices:
+            for name, info in known_voices.items():
+                profiles_reset[name] = info["embedding"].copy()
+                counts_reset[name] = info["samples"]
+        profiles = profiles_reset
+        counts = counts_reset
+        labels.clear()
+        next_anon_id = 0
+
+        for emb in embeddings:
+            best_id = None
+            best_sim = -1.0
+            for sid, profile in profiles.items():
+                sim = cosine_similarity(emb, profile)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_id = sid
+
+            if best_id is not None and best_sim >= threshold:
+                labels.append(best_id)
+                n = counts[best_id]
+                profiles[best_id] = (profiles[best_id] * n + emb) / (n + 1)
+                norm = np.linalg.norm(profiles[best_id])
+                if norm > 0:
+                    profiles[best_id] = profiles[best_id] / norm
+                counts[best_id] = n + 1
+            else:
+                anon_id = next_anon_id
+                next_anon_id += 1
+                labels.append(anon_id)
+                profiles[anon_id] = emb.copy()
+                counts[anon_id] = 1
+
+        if labels == prev_labels:
+            break
+        prev_labels = labels.copy()
+
+    confidences = {}
+    for sid in profiles:
+        sims = [
+            cosine_similarity(embeddings[i], profiles[sid])
+            for i, lbl in enumerate(labels) if lbl == sid
+        ]
+        confidences[sid] = np.mean(sims) if sims else 0.0
+
+    return labels, profiles, confidences
+
+
+def speaker_display_name(label):
+    """Convert a speaker label (str name or int ID) to display string."""
+    if isinstance(label, str):
+        return label
+    return f"Person {SPEAKER_NAMES[label]}" if label < len(SPEAKER_NAMES) else f"Person {label}"
 
 
 def speaker_status_line(profiles, confidences):
@@ -348,12 +517,122 @@ def speaker_status_line(profiles, confidences):
     if not profiles:
         return f"  {DIM}Speakers: (none detected){RESET}"
     parts = []
-    for sid in sorted(profiles.keys()):
-        name = SPEAKER_NAMES[sid] if sid < len(SPEAKER_NAMES) else str(sid)
+    for sid in sorted(profiles.keys(), key=str):
+        name = speaker_display_name(sid)
         conf = confidences.get(sid, 0.0)
         color = GREEN if conf > 0.6 else YELLOW if conf > 0.4 else RED
-        parts.append(f"Person {name} {color}{conf:.0%}{RESET}")
+        parts.append(f"{name} {color}{conf:.0%}{RESET}")
     return f"  {BOLD}Speakers:{RESET} " + f" {DIM}|{RESET} ".join(parts)
+
+
+# ── Real-time speaker identification ───────────────────────────────
+
+@dataclass
+class SpeakerEvent:
+    """Emitted by SpeakerIdentifier when speaker state changes."""
+    timestamp: float
+    event_type: str               # "silence", "unknown", "single", "multiple"
+    speakers: list = field(default_factory=list)          # matched voice names
+    similarities: dict = field(default_factory=dict)      # {name: cosine_sim} for all enrolled
+    is_barge_in: bool = False     # AI voice + human voice both detected
+
+
+class SpeakerIdentifier:
+    """Sliding-window real-time speaker identification against enrolled voices.
+
+    Call feed() with each 1-second audio block. Returns a SpeakerEvent when
+    speaker state changes, None otherwise.
+    """
+
+    def __init__(self, speaker_session, known_voices, noise_floor=None, on_event=None):
+        self._session = speaker_session
+        self._known_voices = known_voices or {}
+        self._noise_floor = noise_floor
+        self._on_event = on_event
+        self._window_samples = int(SAMPLE_RATE * SPEAKER_ID_WINDOW)
+        self._stride_samples = int(SAMPLE_RATE * SPEAKER_ID_STRIDE)
+        self._ring = np.empty((0,), dtype=np.float32)
+        self._samples_since_id = 0
+        self._last_event_type = None
+        self._last_speakers = frozenset()
+
+    def update_voices(self, known_voices):
+        """Hot-update the voice library (e.g. after enrolling a new voice)."""
+        self._known_voices = known_voices or {}
+
+    def feed(self, audio_block):
+        """Feed a 1-second audio block. Returns SpeakerEvent on state change."""
+        self._ring = np.concatenate([self._ring, audio_block])
+        if len(self._ring) > self._window_samples:
+            self._ring = self._ring[-self._window_samples:]
+
+        self._samples_since_id += len(audio_block)
+        if self._samples_since_id < self._stride_samples:
+            return None
+        self._samples_since_id = 0
+
+        event = self._identify()
+
+        if self._on_event:
+            self._on_event(event)
+        return event
+
+    def _identify(self):
+        """Run speaker identification on the current window."""
+        level = rms(self._ring)
+        now = time.time()
+
+        floor = self._noise_floor.level if self._noise_floor else ENERGY_FLOOR_MIN
+        if level < floor:
+            return SpeakerEvent(timestamp=now, event_type="silence")
+
+        if len(self._ring) < SPEAKER_MIN_AUDIO:
+            return SpeakerEvent(timestamp=now, event_type="silence")
+
+        if not self._known_voices:
+            return SpeakerEvent(timestamp=now, event_type="unknown")
+
+        emb = extract_speaker_embedding(self._session, self._ring)
+
+        # Compare against all enrolled voices
+        sims = {}
+        for name, info in self._known_voices.items():
+            sims[name] = cosine_similarity(emb, info["embedding"])
+
+        # Classify matches
+        confident = [n for n, s in sims.items() if s >= SPEAKER_SIM_THRESHOLD]
+        present = [n for n, s in sims.items() if s >= SPEAKER_PRESENCE_THRESHOLD]
+
+        if len(confident) >= 2 or (len(confident) >= 1 and len(present) >= 2):
+            speakers = sorted(present, key=lambda n: sims[n], reverse=True)
+            has_ai = any(n in AI_VOICE_NAMES for n in speakers)
+            has_human = any(n not in AI_VOICE_NAMES for n in speakers)
+            return SpeakerEvent(
+                timestamp=now, event_type="multiple", speakers=speakers,
+                similarities=sims, is_barge_in=has_ai and has_human,
+            )
+        elif len(confident) == 1:
+            return SpeakerEvent(
+                timestamp=now, event_type="single", speakers=confident,
+                similarities=sims,
+            )
+        elif len(present) >= 2:
+            speakers = sorted(present, key=lambda n: sims[n], reverse=True)
+            has_ai = any(n in AI_VOICE_NAMES for n in speakers)
+            has_human = any(n not in AI_VOICE_NAMES for n in speakers)
+            return SpeakerEvent(
+                timestamp=now, event_type="multiple", speakers=speakers,
+                similarities=sims, is_barge_in=has_ai and has_human,
+            )
+        elif len(present) == 1:
+            return SpeakerEvent(
+                timestamp=now, event_type="single", speakers=present,
+                similarities=sims,
+            )
+        else:
+            return SpeakerEvent(
+                timestamp=now, event_type="unknown", similarities=sims,
+            )
 
 
 def wrap_text(text, width):
@@ -378,7 +657,146 @@ def print_wrapped(prefix, text, suffix, width):
         print(f"{prefix}{line}{suffix}")
 
 
+ENROLL_PASSAGE = """The rainbow is a division of white light into many beautiful
+colors. These take the shape of a long round arch, with its path
+high above, and its two ends apparently beyond the horizon. There
+is, according to legend, a pot of gold at one end. People look,
+but no one ever finds it. When a man looks for something beyond
+his reach, his friends say he is looking for the pot of gold at
+the end of the rainbow."""
+
+ENROLL_ROUNDS = [
+    ("Normal voice", "Read this at your normal speaking pace and tone:"),
+    ("Energetic", "Now read it again — upbeat, like you're excited about it:"),
+    ("Calm and slow", "One more time — slow, calm, like you're winding down:"),
+]
+
+ENROLL_DURATION = 15  # seconds per round
+
+
+def enroll_voice(name, fresh=False):
+    """Record audio across multiple intonations and save a voice profile."""
+    print(f"\n{BOLD}{'═' * 60}{RESET}")
+    print(f"{BOLD}  Voice Enrollment: {name}{RESET}")
+    print(f"{BOLD}{'═' * 60}{RESET}\n")
+
+    existing = load_voice_library()
+    if name in existing and not fresh:
+        n = existing[name]["samples"]
+        print(f"{YELLOW}A voice profile for \"{name}\" already exists ({n} sample{'s' if n != 1 else ''}).{RESET}")
+        print(f"{YELLOW}This will blend new audio into the existing profile.{RESET}")
+        print(f"{RED}Only continue if this is the SAME person's voice!{RESET}\n")
+        resp = input(f"{DIM}Continue? [y/N] {RESET}").strip().lower()
+        if resp != "y":
+            print(f"{DIM}Cancelled.{RESET}")
+            return
+    elif name in existing and fresh:
+        print(f"{YELLOW}Starting fresh profile for \"{name}\" (replacing existing).{RESET}\n")
+        existing.pop(name)
+
+    print(f"{DIM}Loading speaker model...{RESET}", end=" ", flush=True)
+    speaker_model_path = download_speaker_model()
+    speaker_session = ort.InferenceSession(speaker_model_path)
+    print(f"{GREEN}ok{RESET}\n")
+
+    print(f"{DIM}You'll read a short passage 3 times with different energy.{RESET}")
+    print(f"{DIM}This captures the natural range of your voice.{RESET}\n")
+
+    embeddings = []
+
+    for i, (style, instruction) in enumerate(ENROLL_ROUNDS):
+        print(f"{BOLD}Round {i+1}/{len(ENROLL_ROUNDS)}: {style}{RESET}")
+        print(f"{YELLOW}{instruction}{RESET}\n")
+        for line in ENROLL_PASSAGE.strip().splitlines():
+            print(f"  {GREEN}{line.strip()}{RESET}")
+
+        print(f"\n{DIM}Press Enter when ready...{RESET}", end="")
+        input()
+        print(f"{YELLOW}Recording ({ENROLL_DURATION}s)...{RESET}")
+
+        audio = sd.rec(int(SAMPLE_RATE * ENROLL_DURATION), samplerate=SAMPLE_RATE,
+                       channels=1, dtype="float32")
+        for sec in range(ENROLL_DURATION, 0, -1):
+            print(f"\r  {BOLD}{sec}s remaining...{RESET}  ", end="", flush=True)
+            time.sleep(1)
+        sd.wait()
+        print(f"\r  {GREEN}Done.{RESET}                    ")
+
+        audio = audio.flatten()
+        level = rms(audio)
+        if level < ENERGY_FLOOR:
+            print(f"{RED}Too quiet — skipping this round.{RESET}\n")
+            continue
+
+        # Extract multiple embeddings from 5s segments for robustness
+        seg_len = SAMPLE_RATE * 5
+        for start in range(0, len(audio) - seg_len + 1, seg_len):
+            segment = audio[start : start + seg_len]
+            if rms(segment) >= ENERGY_FLOOR:
+                embeddings.append(extract_speaker_embedding(speaker_session, segment))
+
+        print(f"  {DIM}Extracted {len(embeddings)} segments so far{RESET}\n")
+
+    if not embeddings:
+        print(f"{RED}No usable audio captured. Try again closer to the mic.{RESET}")
+        return
+
+    # Average all segment embeddings
+    avg_embedding = np.mean(embeddings, axis=0)
+    norm = np.linalg.norm(avg_embedding)
+    if norm > 0:
+        avg_embedding = avg_embedding / norm
+
+    # Blend with existing profile if present
+    if name in existing:
+        old = existing[name]
+        n = old["samples"]
+        blended = (old["embedding"] * n + avg_embedding) / (n + 1)
+        norm = np.linalg.norm(blended)
+        if norm > 0:
+            blended = blended / norm
+        path = save_voice(name, blended, n + 1)
+        print(f"{GREEN}Updated voice profile for {BOLD}{name}{RESET}{GREEN} ({n+1} samples){RESET}")
+    else:
+        path = save_voice(name, avg_embedding, 1)
+        print(f"{GREEN}Saved voice profile for {BOLD}{name}{RESET}")
+
+    print(f"{DIM}{path}{RESET}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="On-device audio intelligence")
+    parser.add_argument("--enroll", metavar="NAME", help="Enroll a voice (blends with existing)")
+    parser.add_argument("-n", action="store_true", help="With --enroll: start fresh instead of blending")
+    parser.add_argument("--remove", metavar="NAME", nargs="?", const="__list__",
+                        help="Remove a voice profile (omit name to list)")
+    args = parser.parse_args()
+
+    if args.remove is not None:
+        if args.remove == "__list__":
+            voices = list_voices()
+            if not voices:
+                print(f"{DIM}No enrolled voices.{RESET}")
+            else:
+                print(f"\n{BOLD}Enrolled voices:{RESET}")
+                for name, samples in voices:
+                    print(f"  {CYAN}{name}{RESET} {DIM}({samples} sample{'s' if samples != 1 else ''}){RESET}")
+                print(f"\n{DIM}Usage: --remove \"Name\"{RESET}")
+            return
+
+        if remove_voice(args.remove):
+            print(f"{GREEN}Removed voice profile: {BOLD}{args.remove}{RESET}")
+        else:
+            print(f"{RED}No voice profile found for: {args.remove}{RESET}")
+            voices = list_voices()
+            if voices:
+                print(f"{DIM}Known voices: {', '.join(n for n, _ in voices)}{RESET}")
+        return
+
+    if args.enroll:
+        enroll_voice(args.enroll, fresh=args.n)
+        return
+
     print(f"\n{BOLD}{'═' * 60}{RESET}")
     print(f"{BOLD}  On-Device Audio Intelligence Demo{RESET}")
     print(f"{DIM}  STT (Whisper) + Sounds (YAMNet) + Speakers (WeSpeaker){RESET}")
@@ -403,8 +821,20 @@ def main():
     speaker_session = ort.InferenceSession(speaker_model_path)
     print(f"{GREEN}ok{RESET}")
 
+    # ── Load voice library ──────────────────────────────────────────
+    known_voices = load_voice_library()
+    if known_voices:
+        print(f"\n  {CYAN}Known voices:{RESET} {', '.join(known_voices.keys())}")
+    else:
+        print(f"\n  {DIM}No enrolled voices (use --enroll \"Name\" to add){RESET}")
+
+    noise_floor = NoiseFloor()
+
+    # ── Real-time speaker identifier ─────────────────────────────
+    speaker_id = SpeakerIdentifier(speaker_session, known_voices, noise_floor=noise_floor)
+
     print(f"\n{GREEN}Ready! Listening on your mic.{RESET}")
-    print(f"{DIM}Chunks: {CHUNK_SECONDS}s | silence gate: RMS < {ENERGY_FLOOR} | sound threshold: {SOUND_CONFIDENCE:.0%}{RESET}")
+    print(f"{DIM}Chunks: {CHUNK_SECONDS}s | adaptive noise floor | sound threshold: {SOUND_CONFIDENCE:.0%}{RESET}")
     print(f"{DIM}Press Ctrl+C to stop.{RESET}\n")
     print(f"{'─' * 60}")
 
@@ -414,16 +844,10 @@ def main():
     prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)  # overlap for Whisper
     passage = ""               # current in-progress passage
     passages = []              # completed passages
-    lines_to_clear = 0        # lines to wipe for live passage redraw
     last_sounds = frozenset()  # deduplicate consecutive identical sound events
-
-    # Speaker diarization state
-    passage_audio_buf = np.empty((0,), dtype=np.float32)  # audio for current passage
-    passage_embeddings = []    # one embedding per speech passage only
-    passage_has_speech = []    # bool per passage — False = ambient only
-    speaker_labels = []        # speaker ID per passage (None for ambient)
-    speaker_profiles = {}      # speaker_id -> averaged embedding
-    speaker_confidences = {}   # speaker_id -> avg cosine sim
+    sound_streak = {}          # label -> consecutive chunk count (for ambient suppression)
+    AMBIENT_STREAK = 3         # if a sound appears this many chunks in a row, it's background
+    current_speaker = None     # who the real-time ID thinks is talking right now
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -446,61 +870,49 @@ def main():
                 data = data.flatten()
                 buffer = np.concatenate([buffer, data])
 
+                # ── Real-time speaker identification ─────────────
+                sid_event = speaker_id.feed(data)
+                if sid_event and sid_event.event_type != "silence":
+                    top = sid_event.speakers[0] if sid_event.speakers else None
+                    if top and top != current_speaker:
+                        sim = sid_event.similarities.get(top, 0.0)
+                        parts = [f"{top} {sim:.0%}"]
+                        # Show other detected voices (barge-in)
+                        for name in sid_event.speakers[1:]:
+                            parts.append(f"{name} {sid_event.similarities.get(name, 0.0):.0%}")
+                        label = " | ".join(parts)
+                        # Inject speaker tag into passage
+                        tag = f"[{top}]"
+                        if passage:
+                            passage += f" {tag}"
+                        else:
+                            passage = tag
+                        print(f"  {CYAN}[{label}]{RESET}")
+                        current_speaker = top
+                    elif not top and current_speaker is not None:
+                        current_speaker = None
+
                 # ── Check each 1s block for silence ──────────────
                 block_level = rms(data)
+                noise_floor.update(block_level)
                 ts = time.strftime("%H:%M:%S")
 
-                if block_level < ENERGY_FLOOR:
+                if block_level < noise_floor.level:
                     silent_blocks += 1
                     # Flush passage after 2 consecutive silent blocks (~2s)
                     if silent_blocks == 2 and passage:
-                        has_speech = len(passage_audio_buf) >= SPEAKER_MIN_AUDIO
-
-                        if has_speech:
-                            emb = extract_speaker_embedding(speaker_session, passage_audio_buf)
-                            passage_embeddings.append(emb)
-
                         passages.append(passage)
-                        passage_has_speech.append(has_speech)
-
-                        # Re-cluster only speech passages
-                        speaker_labels_speech, speaker_profiles, speaker_confidences = \
-                            assign_speakers(passage_embeddings)
-
-                        # Map back: speech passages get speaker labels, ambient gets None
-                        speaker_labels = []
-                        si = 0
-                        for hs in passage_has_speech:
-                            if hs:
-                                speaker_labels.append(speaker_labels_speech[si])
-                                si += 1
-                            else:
-                                speaker_labels.append(None)
-
-                        # Wipe live draft and reprint finalized passage
-                        if lines_to_clear > 0:
-                            sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
-
-                        if has_speech:
-                            cur_label = speaker_labels[-1]
-                            name = SPEAKER_NAMES[cur_label] if cur_label < len(SPEAKER_NAMES) else str(cur_label)
-                            label_str = f"  {CYAN}[Person {name}]{RESET}"
-                        else:
-                            label_str = f"  {DIM}[Ambient]{RESET}"
                         print(f"  {BOLD}{'·' * 50}{RESET}")
-                        print(label_str)
                         print_wrapped(f"  {GREEN}", passage, f"{RESET}", 70)
                         print(f"  {BOLD}{'·' * 50}{RESET}\n")
 
                         passage = ""
-                        passage_audio_buf = np.empty((0,), dtype=np.float32)
-                        lines_to_clear = 0
+                        current_speaker = None
                         prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)
                         buffer = np.empty((0,), dtype=np.float32)
                     if silent_blocks == 1:
                         print(f"  {DIM}Silence...{RESET}", flush=True)
-                    if len(buffer) < CHUNK_SAMPLES:
-                        continue
+                    continue
                 else:
                     silent_blocks = 0
 
@@ -509,6 +921,9 @@ def main():
 
                 chunk = buffer[:CHUNK_SAMPLES]
                 buffer = buffer[CHUNK_SAMPLES:]
+
+                # ── Bandpass filter: keep 300–3400 Hz (voice band) ──
+                chunk = sosfilt(VOICE_BANDPASS, chunk).astype(np.float32)
 
                 level = rms(chunk)
 
@@ -529,38 +944,25 @@ def main():
                 )
                 text = ""
                 if level >= SPEECH_ENERGY and yamnet_sees_speech:
-                    # Skip Whisper if non-speech sounds dominate (prevents hallucinations)
-                    speech_score = max(
-                        (score for label, score in sounds if label in SPEECH_SOUNDS),
-                        default=0.0,
+                    whisper_input = np.concatenate([prev_chunk, chunk])
+                    segments, info = whisper.transcribe(
+                        whisper_input, beam_size=1, language="en",
+                        initial_prompt=WHISPER_PROMPT,
                     )
-                    nonspeech_score = max(
-                        (score for label, score in sounds if label not in SPEECH_SOUNDS and label not in BORING_SOUNDS),
-                        default=0.0,
-                    )
-                    if nonspeech_score > speech_score:
-                        pass  # clapping/yelling/etc — let YAMNet handle it, skip Whisper
-                    else:
-                        whisper_input = np.concatenate([prev_chunk, chunk])
-                        segments, info = whisper.transcribe(
-                            whisper_input, beam_size=1, language="en",
-                            vad_filter=True, initial_prompt=WHISPER_PROMPT,
-                        )
-                        text = " ".join(s.text.strip() for s in segments).strip()
-                        for wrong, right in WORD_FIXES.items():
-                            text = text.replace(wrong, right)
-                        # Filter out prompt hallucinations
+                    text = " ".join(s.text.strip() for s in segments).strip()
+                    for wrong, right in WORD_FIXES.items():
+                        text = text.replace(wrong, right)
+                    # Filter out prompt hallucinations
+                    if text:
                         prompt_words = set(WHISPER_PROMPT.lower().split())
-                        text_words = set(text.lower().replace(",", "").replace(".", "").split())
-                        if text_words and text_words.issubset(prompt_words):
-                            text = ""
+                        text_words = text.lower().replace(",", "").replace(".", "").split()
+                        if text_words:
+                            prompt_overlap = sum(1 for w in text_words if w in prompt_words)
+                            if prompt_overlap / len(text_words) > 0.6:
+                                text = ""
 
                 # Save tail of this chunk as overlap for next round
                 prev_chunk = chunk[-OVERLAP_SAMPLES:]
-
-                # Accumulate audio for speaker embedding
-                if text:
-                    passage_audio_buf = np.concatenate([passage_audio_buf, chunk])
 
                 # ── Inject sounds into passage as stage directions ────
                 if notable_sounds:
@@ -581,54 +983,20 @@ def main():
                 # ── Build passage live ────────────────────────────────
                 if text:
                     passage = stitch(passage, text)
-                    display = wrap_text(passage, 70)
-                    # Wipe previous draft
-                    if lines_to_clear > 0:
-                        sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
-                    for line in display:
-                        print(f"  {DIM}▌{RESET} {GREEN}{line}{RESET}")
-                    lines_to_clear = len(display)
-                    sys.stdout.flush()
-                elif not notable_sounds:
-                    if lines_to_clear > 0:
-                        sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
-                        lines_to_clear = 0
+                    print(f"  {DIM}▌{RESET} {GREEN}{text}{RESET}")
 
     except KeyboardInterrupt:
         # Flush any in-progress passage
         if passage:
-            has_speech = len(passage_audio_buf) >= SPEAKER_MIN_AUDIO
-            if has_speech:
-                emb = extract_speaker_embedding(speaker_session, passage_audio_buf)
-                passage_embeddings.append(emb)
             passages.append(passage)
-            passage_has_speech.append(has_speech)
-
-            speaker_labels_speech, speaker_profiles, speaker_confidences = \
-                assign_speakers(passage_embeddings)
-            speaker_labels = []
-            si = 0
-            for hs in passage_has_speech:
-                if hs:
-                    speaker_labels.append(speaker_labels_speech[si])
-                    si += 1
-                else:
-                    speaker_labels.append(None)
 
         print(f"\n\n{YELLOW}Stopped.{RESET}")
         if passages:
             print(f"\n{BOLD}{'═' * 60}{RESET}")
             print(f"{BOLD}  All passages:{RESET}")
             for i, p in enumerate(passages):
-                lbl = speaker_labels[i] if i < len(speaker_labels) else None
-                if lbl is not None:
-                    name = SPEAKER_NAMES[lbl] if lbl < len(SPEAKER_NAMES) else str(lbl)
-                    label_str = f"{CYAN}Person {name}{RESET}"
-                else:
-                    label_str = f"{DIM}Ambient{RESET}"
-                print(f"\n  {DIM}[{i+1}]{RESET} {label_str}")
+                print(f"\n  {DIM}[{i+1}]{RESET}")
                 print_wrapped(f"  {GREEN}", p, f"{RESET}", 70)
-            print(f"\n{speaker_status_line(speaker_profiles, speaker_confidences)}")
             print(f"\n{BOLD}{'═' * 60}{RESET}")
 
 
