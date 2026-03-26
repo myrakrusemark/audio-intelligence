@@ -12,7 +12,8 @@ import argparse
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import numpy as np
-from scipy.signal import butter, sosfilt
+import yaml
+# from scipy.signal import butter, sosfilt  # bandpass disabled — revisit with better mic
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from pathlib import Path
@@ -26,53 +27,49 @@ import urllib.request
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 
-SAMPLE_RATE = 16000
-CHUNK_SECONDS = 2
+# ── Load config ────────────────────────────────────────────────────────
+CONFIG_PATH = Path(__file__).parent / "config.yaml"
+with open(CONFIG_PATH) as f:
+    CFG = yaml.safe_load(f)
+
+SAMPLE_RATE = CFG["sample_rate"]
+CHUNK_SECONDS = CFG["chunk_seconds"]
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
-OVERLAP_SECONDS = 1.5      # feed Whisper 1.5s of prior audio for context
+OVERLAP_SECONDS = CFG["overlap_seconds"]
 OVERLAP_SAMPLES = int(SAMPLE_RATE * OVERLAP_SECONDS)
 
-# ── Whisper prompt — biases decoder toward these words/names ────────────
-WHISPER_PROMPT = "Fathom, the AI agent called Fathom"
+WHISPER_MODEL = CFG["whisper_model"]
+WHISPER_LANGUAGE = CFG["whisper_language"]
+WHISPER_BEAM_SIZE = CFG["whisper_beam_size"]
+WHISPER_PROMPT = CFG["whisper_prompt"]
+WORD_FIXES = CFG.get("word_fixes", {})
+PROMPT_HALLUCINATION_THRESHOLD = CFG["prompt_hallucination_threshold"]
 
-# ── Post-processing fixes for known Whisper mishearings ────────────────
-WORD_FIXES = {
-    "Adam": "Fathom",
-    "adam": "Fathom",
-    "Phantom": "Fathom",
-    "phantom": "Fathom",
-}
+ENERGY_FLOOR_MIN = CFG["energy_floor_min"]
+ENERGY_FLOOR_MARGIN = CFG["energy_floor_margin"]
+NOISE_FLOOR_WINDOW = CFG["noise_floor_window"]
+SPEECH_ENERGY = CFG["speech_energy"]
+SILENCE_BLOCKS = CFG["silence_blocks"]
+SOUND_CONFIDENCE = CFG["sound_confidence"]
+YAMNET_SPEECH_THRESHOLD = CFG["yamnet_speech_threshold"]
+SENSITIVE_SOUNDS = CFG.get("sensitive_sounds", {})
 
-# ── Thresholds ──────────────────────────────────────────────────────────
-ENERGY_FLOOR_MIN = 0.005   # absolute minimum noise floor
-ENERGY_FLOOR_MARGIN = 1.5  # noise floor = ambient RMS * this multiplier
-NOISE_FLOOR_WINDOW = 10    # seconds of history for rolling noise floor
-SOUND_CONFIDENCE = 0.15    # default threshold for most sounds
+# Bandpass filter disabled — revisit with better mic
+# VOICE_BANDPASS = butter(
+#     CFG["bandpass_order"],
+#     [CFG["bandpass_low"], CFG["bandpass_high"]],
+#     btype='band', fs=SAMPLE_RATE, output='sos',
+# )
 
-# ── Voice bandpass filter (cuts AC hum, fan noise, high-freq artifacts) ──
-VOICE_BANDPASS = butter(4, [300, 3400], btype='band', fs=SAMPLE_RATE, output='sos')
+SPEAKER_SIM_THRESHOLD = CFG["speaker_sim_threshold"]
+SPEAKER_PRESENCE_THRESHOLD = CFG["speaker_presence_threshold"]
+SPEAKER_MIN_AUDIO = int(SAMPLE_RATE * CFG["speaker_min_seconds"])
+SPEAKER_ID_WINDOW = CFG["speaker_id_window"]
+SPEAKER_ID_STRIDE = CFG["speaker_id_stride"]
+AI_VOICE_NAMES = set(CFG.get("ai_voice_names", []))
 
-# Sounds that are reliably accurate even at low confidence — give them a lower bar
-SENSITIVE_SOUNDS = {
-    "Cat": 0.06, "Meow": 0.06, "Purr": 0.06, "Hiss": 0.08,
-    "Dog": 0.06, "Bark": 0.06, "Growling": 0.08,
-    "Doorbell": 0.06, "Door": 0.08, "Knock": 0.08,
-    "Alarm": 0.06, "Smoke detector, smoke alarm": 0.05,
-    "Fire alarm": 0.05, "Siren": 0.06,
-    "Glass": 0.08, "Shatter": 0.06,
-    "Gunshot, gunfire": 0.06, "Explosion": 0.06,
-    "Baby cry, infant cry": 0.06,
-    "Telephone": 0.08, "Ringtone": 0.08,
-}
-SPEECH_ENERGY = 0.01       # RMS needed before we bother running Whisper
-
-# ── Speaker diarization ──────────────────────────────────────────────
-SPEAKER_SIM_THRESHOLD = 0.35  # cosine similarity above this = same speaker
-SPEAKER_PRESENCE_THRESHOLD = 0.25  # lower bar for detecting voice in mixed audio
-SPEAKER_MIN_AUDIO = int(SAMPLE_RATE * 1.5)  # need 1.5s of speech to diarize
-SPEAKER_ID_WINDOW = 2.0      # seconds of audio in sliding window for real-time ID
-SPEAKER_ID_STRIDE = 1.0      # run identification every N seconds
-AI_VOICE_NAMES = {"Fathom"}  # enrolled voices that are AI/TTS (for barge-in detection)
+STITCH_MIN_OVERLAP = CFG["stitch_min_overlap_words"]
+STITCH_MATCH_RATIO = CFG["stitch_match_ratio"]
 
 # Speech-related YAMNet labels — used to gate Whisper and suppress from display
 SPEECH_SOUNDS = {
@@ -128,7 +125,7 @@ class NoiseFloor:
             self._last_printed = rounded
 
 
-def stitch(prev_text, new_text, min_overlap_words=2):
+def stitch(prev_text, new_text, min_overlap_words=STITCH_MIN_OVERLAP):
     """Fuzzy-merge new_text onto prev_text by finding the overlapping tail/head."""
     if not prev_text:
         return new_text
@@ -148,7 +145,7 @@ def stitch(prev_text, new_text, min_overlap_words=2):
         head = " ".join(new_words[:overlap_len]).lower()
         ratio = SequenceMatcher(None, tail, head).ratio()
         # Accept fuzzy match (handles minor Whisper variations)
-        if ratio > 0.6 and ratio >= best_ratio:
+        if ratio > STITCH_MATCH_RATIO and ratio >= best_ratio:
             best_ratio = ratio
             best_match_len = overlap_len
 
@@ -806,8 +803,8 @@ def main():
     # ── Load models ─────────────────────────────────────────────────
     print(f"{YELLOW}Loading models (first run downloads ~100MB)...{RESET}")
 
-    print(f"  {DIM}Loading Whisper (tiny)...{RESET}", end=" ", flush=True)
-    whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
+    print(f"  {DIM}Loading Whisper ({WHISPER_MODEL})...{RESET}", end=" ", flush=True)
+    whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     print(f"{GREEN}ok{RESET}")
 
     print(f"  {DIM}Loading YAMNet...{RESET}", end=" ", flush=True)
@@ -829,7 +826,6 @@ def main():
         print(f"\n  {DIM}No enrolled voices (use --enroll \"Name\" to add){RESET}")
 
     noise_floor = NoiseFloor()
-
     # ── Real-time speaker identifier ─────────────────────────────
     speaker_id = SpeakerIdentifier(speaker_session, known_voices, noise_floor=noise_floor)
 
@@ -900,7 +896,7 @@ def main():
                 if block_level < noise_floor.level:
                     silent_blocks += 1
                     # Flush passage after 2 consecutive silent blocks (~2s)
-                    if silent_blocks == 2 and passage:
+                    if silent_blocks >= SILENCE_BLOCKS and passage:
                         passages.append(passage)
                         print(f"  {BOLD}{'·' * 50}{RESET}")
                         print_wrapped(f"  {GREEN}", passage, f"{RESET}", 70)
@@ -910,7 +906,7 @@ def main():
                         current_speaker = None
                         prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)
                         buffer = np.empty((0,), dtype=np.float32)
-                    if silent_blocks == 1:
+                    if silent_blocks == 1:  # print once on first silent block
                         print(f"  {DIM}Silence...{RESET}", flush=True)
                     continue
                 else:
@@ -921,9 +917,6 @@ def main():
 
                 chunk = buffer[:CHUNK_SAMPLES]
                 buffer = buffer[CHUNK_SAMPLES:]
-
-                # ── Bandpass filter: keep 300–3400 Hz (voice band) ──
-                chunk = sosfilt(VOICE_BANDPASS, chunk).astype(np.float32)
 
                 level = rms(chunk)
 
@@ -939,14 +932,14 @@ def main():
                 # ── Speech-to-text (only if YAMNet thinks there's a voice) ──
                 # Check all YAMNet results (not just notable) for speech-like labels
                 yamnet_sees_speech = any(
-                    label in SPEECH_SOUNDS and score > 0.08
+                    label in SPEECH_SOUNDS and score > YAMNET_SPEECH_THRESHOLD
                     for label, score in sounds
                 )
                 text = ""
                 if level >= SPEECH_ENERGY and yamnet_sees_speech:
                     whisper_input = np.concatenate([prev_chunk, chunk])
                     segments, info = whisper.transcribe(
-                        whisper_input, beam_size=1, language="en",
+                        whisper_input, beam_size=WHISPER_BEAM_SIZE, language=WHISPER_LANGUAGE,
                         initial_prompt=WHISPER_PROMPT,
                     )
                     text = " ".join(s.text.strip() for s in segments).strip()
@@ -958,7 +951,7 @@ def main():
                         text_words = text.lower().replace(",", "").replace(".", "").split()
                         if text_words:
                             prompt_overlap = sum(1 for w in text_words if w in prompt_words)
-                            if prompt_overlap / len(text_words) > 0.6:
+                            if prompt_overlap / len(text_words) > PROMPT_HALLUCINATION_THRESHOLD:
                                 text = ""
 
                 # Save tail of this chunk as overlap for next round

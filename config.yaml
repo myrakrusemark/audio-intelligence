@@ -1,0 +1,72 @@
+# ── Audio capture ──────────────────────────────────────────────────
+sample_rate: 16000
+chunk_seconds: 2
+overlap_seconds: 1.5        # prior audio fed to Whisper for cross-boundary context
+
+# ── Whisper STT ───────────────────────────────────────────────────
+whisper_model: "tiny"        # tiny (~75MB), small (~460MB), medium
+whisper_language: "en"
+whisper_beam_size: 1
+whisper_prompt: "Fathom, the AI agent called Fathom"
+word_fixes:                  # post-processing for known mishearings
+  Adam: Fathom
+  adam: Fathom
+  Phantom: Fathom
+  phantom: Fathom
+prompt_hallucination_threshold: 0.6  # reject if this fraction of words match prompt
+
+# ── Noise & energy ────────────────────────────────────────────────
+energy_floor_min: 0.005      # absolute minimum noise floor (RMS)
+energy_floor_margin: 1.5     # noise floor = ambient RMS * this
+noise_floor_window: 10       # seconds of history for rolling noise floor
+speech_energy: 0.01          # RMS needed before running Whisper
+silence_blocks: 2            # consecutive silent 1s blocks before passage flush
+
+# ── Voice bandpass filter ─────────────────────────────────────────
+bandpass_low: 300            # Hz
+bandpass_high: 3400          # Hz
+bandpass_order: 4
+
+# ── RNNoise (disabled — too aggressive with current mic) ──────────
+rnnoise_enabled: false
+rnnoise_blend: 0.5           # 0.0 = original only, 1.0 = full denoise
+
+# ── YAMNet sound classification ───────────────────────────────────
+sound_confidence: 0.15       # default threshold for most sounds
+yamnet_speech_threshold: 0.08  # YAMNet score to consider speech present
+
+sensitive_sounds:            # per-label confidence overrides
+  Cat: 0.06
+  Meow: 0.06
+  Purr: 0.06
+  Hiss: 0.08
+  Dog: 0.06
+  Bark: 0.06
+  Growling: 0.08
+  Doorbell: 0.06
+  Door: 0.08
+  Knock: 0.08
+  Alarm: 0.06
+  "Smoke detector, smoke alarm": 0.05
+  "Fire alarm": 0.05
+  Siren: 0.06
+  Glass: 0.08
+  Shatter: 0.06
+  "Gunshot, gunfire": 0.06
+  Explosion: 0.06
+  "Baby cry, infant cry": 0.06
+  Telephone: 0.08
+  Ringtone: 0.08
+
+# ── Speaker diarization ──────────────────────────────────────────
+speaker_sim_threshold: 0.35  # cosine similarity = same speaker
+speaker_presence_threshold: 0.25  # lower bar for mixed audio detection
+speaker_min_seconds: 1.5     # minimum audio to extract speaker embedding
+speaker_id_window: 2.0       # seconds in sliding window for real-time ID
+speaker_id_stride: 1.0       # run identification every N seconds
+ai_voice_names:              # enrolled voices that are AI/TTS (for barge-in)
+  - Fathom
+
+# ── Fuzzy stitching ──────────────────────────────────────────────
+stitch_min_overlap_words: 2
+stitch_match_ratio: 0.6      # SequenceMatcher threshold for fuzzy merge
