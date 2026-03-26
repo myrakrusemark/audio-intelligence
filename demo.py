@@ -24,9 +24,33 @@ CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
 OVERLAP_SECONDS = 1        # feed Whisper 1s of prior audio for context
 OVERLAP_SAMPLES = SAMPLE_RATE * OVERLAP_SECONDS
 
+# ── Whisper prompt — biases decoder toward these words/names ────────────
+WHISPER_PROMPT = "Fathom, the AI agent called Fathom"
+
+# ── Post-processing fixes for known Whisper mishearings ────────────────
+WORD_FIXES = {
+    "Adam": "Fathom",
+    "adam": "Fathom",
+    "Phantom": "Fathom",
+    "phantom": "Fathom",
+}
+
 # ── Thresholds ──────────────────────────────────────────────────────────
 ENERGY_FLOOR = 0.005       # RMS below this = silence, skip entirely
-SOUND_CONFIDENCE = 0.15    # only show YAMNet labels above this
+SOUND_CONFIDENCE = 0.15    # default threshold for most sounds
+
+# Sounds that are reliably accurate even at low confidence — give them a lower bar
+SENSITIVE_SOUNDS = {
+    "Cat": 0.06, "Meow": 0.06, "Purr": 0.06, "Hiss": 0.08,
+    "Dog": 0.06, "Bark": 0.06, "Growling": 0.08,
+    "Doorbell": 0.06, "Door": 0.08, "Knock": 0.08,
+    "Alarm": 0.06, "Smoke detector, smoke alarm": 0.05,
+    "Fire alarm": 0.05, "Siren": 0.06,
+    "Glass": 0.08, "Shatter": 0.06,
+    "Gunshot, gunfire": 0.06, "Explosion": 0.06,
+    "Baby cry, infant cry": 0.06,
+    "Telephone": 0.08, "Ringtone": 0.08,
+}
 SPEECH_ENERGY = 0.01       # RMS needed before we bother running Whisper
 
 # Speech-related YAMNet labels — used to gate Whisper and suppress from display
@@ -220,7 +244,7 @@ def main():
 
     # ── Audio capture loop ──────────────────────────────────────────
     audio_q = queue.Queue()
-    silent_chunks = 0
+    silent_blocks = 0
     prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)  # overlap for Whisper
     passage = ""               # current in-progress passage
     passages = []              # completed passages
@@ -247,22 +271,14 @@ def main():
                 data = data.flatten()
                 buffer = np.concatenate([buffer, data])
 
-                if len(buffer) < CHUNK_SAMPLES:
-                    continue
-
-                chunk = buffer[:CHUNK_SAMPLES]
-                buffer = buffer[CHUNK_SAMPLES:]
-
-                # ── Energy gate ─────────────────────────────────────
-                level = rms(chunk)
+                # ── Check each 1s block for silence ──────────────
+                block_level = rms(data)
                 ts = time.strftime("%H:%M:%S")
 
-                if level < ENERGY_FLOOR:
-                    silent_chunks += 1
-                    prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)
-                    # First silence after speech = flush the passage
-                    if silent_chunks == 1 and passage:
-                        # Overwrite the live draft with the final version
+                if block_level < ENERGY_FLOOR:
+                    silent_blocks += 1
+                    # Flush passage after 2 consecutive silent blocks (~2s)
+                    if silent_blocks == 2 and passage:
                         if lines_to_clear > 0:
                             sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
                         print(f"  {BOLD}{'·' * 50}{RESET}")
@@ -271,19 +287,30 @@ def main():
                         passages.append(passage)
                         passage = ""
                         lines_to_clear = 0
-                    # Show a heartbeat every 5 silent chunks so you know it's alive
-                    if silent_chunks % 5 == 1:
-                        print(f"  {DIM}[{ts}] {energy_bar(level)} silent — listening...{RESET}", flush=True)
+                        prev_chunk = np.zeros(OVERLAP_SAMPLES, dtype=np.float32)
+                        buffer = np.empty((0,), dtype=np.float32)
+                    if silent_blocks % 5 == 1:
+                        print(f"  {DIM}[{ts}] {energy_bar(block_level)} silent — listening...{RESET}", flush=True)
+                    if len(buffer) < CHUNK_SAMPLES:
+                        continue
+                else:
+                    silent_blocks = 0
+
+                if len(buffer) < CHUNK_SAMPLES:
                     continue
 
-                silent_chunks = 0
+                chunk = buffer[:CHUNK_SAMPLES]
+                buffer = buffer[CHUNK_SAMPLES:]
+
+                level = rms(chunk)
 
                 # ── Sound classification (always run if above energy floor) ──
                 sounds = classify_sounds(interpreter, chunk, class_names)
                 notable_sounds = [
                     (label, score)
                     for label, score in sounds
-                    if score > SOUND_CONFIDENCE and label not in BORING_SOUNDS
+                    if label not in BORING_SOUNDS
+                    and score > SENSITIVE_SOUNDS.get(label, SOUND_CONFIDENCE)
                 ]
 
                 # ── Speech-to-text (only if YAMNet thinks there's a voice) ──
@@ -296,9 +323,12 @@ def main():
                 if level >= SPEECH_ENERGY and yamnet_sees_speech:
                     whisper_input = np.concatenate([prev_chunk, chunk])
                     segments, info = whisper.transcribe(
-                        whisper_input, beam_size=1, language="en", vad_filter=True
+                        whisper_input, beam_size=1, language="en",
+                        vad_filter=True, initial_prompt=WHISPER_PROMPT,
                     )
                     text = " ".join(s.text.strip() for s in segments).strip()
+                    for wrong, right in WORD_FIXES.items():
+                        text = text.replace(wrong, right)
 
                 # Save tail of this chunk as overlap for next round
                 prev_chunk = chunk[-OVERLAP_SAMPLES:]
